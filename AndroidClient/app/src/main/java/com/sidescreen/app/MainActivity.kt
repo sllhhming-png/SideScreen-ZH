@@ -661,7 +661,7 @@ class MainActivity : AppCompatActivity() {
     private fun diagnosticCallbackIsCurrent(session: Long): Boolean = diagnosticAttempts?.isCurrent(session) ?: true
 
     private fun diagnosticText(stats: DiagnosticStats): String =
-        stats.snapshot().text(Build.VERSION.RELEASE, Build.VERSION.SDK_INT) +
+        stats.snapshot().text(Build.VERSION.RELEASE, Build.VERSION.SDK_INT, "${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})") +
             "\n本进程已拒绝重叠连接尝试: ${diagnosticAttempts?.rejectedCount() ?: 0}（未启动第二连接）"
 
     private fun showDiagnosticDialog() {

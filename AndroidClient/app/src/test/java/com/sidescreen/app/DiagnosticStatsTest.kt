@@ -155,6 +155,65 @@ class DiagnosticStatsTest {
         assertTrue(result.text("12", 31).contains("未开始（unknown）"))
     }
 
+    @Test fun presentationFromEvictedHandoffWindowMustBecomeUnknown() {
+        val stats = DiagnosticStats(2)
+        val session = stats.beginSession(0)
+        stats.handedToSurface(session, 1000, 6_000_000)
+        stats.presented(session, 1000, 101_000_000)
+        stats.handedToSurface(session, 200_000, 205_000_000)
+        stats.handedToSurface(session, 201_000, 206_000_000)
+        assertNull(stats.snapshot().presentation)
+    }
+
+    @Test fun presentationIncludesOnlyCurrentHandoffPts() {
+        val stats = DiagnosticStats(2)
+        val session = stats.beginSession(0)
+        stats.handedToSurface(session, 1000, 6_000_000)
+        stats.presented(session, 1000, 101_000_000)
+        stats.handedToSurface(session, 200_000, 205_000_000)
+        stats.presented(session, 200_000, 210_000_000)
+        stats.handedToSurface(session, 201_000, 206_000_000)
+        val result = stats.snapshot().presentation!!
+        assertEquals(1, result.count)
+        assertEquals(10.0, result.p50Ms, 0.00001)
+    }
+
+    @Test fun filteredOutputsStillHavePreFilterDelayAndReleaseHasItsOwnClock() {
+        val stats = DiagnosticStats(2)
+        val session = stats.beginSession(0)
+        stats.output(session, 1000, 121_000_000) // 120ms: could be filtered by playback.
+        assertEquals(120.0, stats.snapshot().outputDelay!!.p50Ms, 0.00001)
+        assertNull(stats.snapshot().handoff)
+        stats.handedToSurface(session, 200_000, 205_000_000)
+        stats.released(session, 200_000, 205_000_000, 214_000_000)
+        assertEquals(9.0,stats.snapshot().releaseCall!!.p50Ms,0.00001)
+        val next = stats.beginSession(300_000_000)
+        stats.output(session, 400_000, 500_000_000)
+        stats.released(session,200_000,205_000_000,214_000_000)
+        assertNull(stats.snapshot().outputDelay); assertNull(stats.snapshot().releaseCall)
+        for (i in 1L..10L) stats.output(next, 400_000+i, 500_000_000+i*1000)
+        assertEquals(2,stats.snapshot().outputDelay!!.count)
+    }
+
+    @Test fun surfaceToRenderDistributionUsesPairedFramesNotPercentileSubtraction() {
+        val stats = DiagnosticStats()
+        val session = stats.beginSession(0)
+        for ((pts,handed,rendered) in listOf(Triple(1000L,11_000_000L,21_000_000L), Triple(2000L,22_000_000L,22_000_000L), Triple(3000L,23_000_000L,33_000_000L))) {
+            stats.handedToSurface(session,pts,handed); stats.presented(session,pts,rendered)
+        }
+        assertEquals(10.0,stats.snapshot().afterSurface!!.p50Ms,0.00001)
+    }
+
+    @Test fun cropIsOptionalAndInvalidBoundsNeverProduceEffectiveDimensions() {
+        assertEquals(2000 to 1200,DecoderCrop(0,0,1999,1199).effectiveSize(2016,1216))
+        for (crop in listOf(DecoderCrop(-1,0,1999,1199), DecoderCrop(0,0,2016,1199),DecoderCrop(10,0,9,1199),DecoderCrop(0,2,1999,1))) assertNull(crop.effectiveSize(2016,1216))
+        val stats = DiagnosticStats(); val session = stats.beginSession(0)
+        stats.outputSize(session,2016,1216)
+        assertNull(stats.snapshot().crop)
+        stats.outputSize(session,2016,1216,DecoderCrop(0,0,1999,1199))
+        assertEquals(2000 to 1200,stats.snapshot().crop!!.effectiveSize(2016,1216))
+    }
+
     @Test fun reportUsesAllowlistedMetadataAndDoesNotInferUnknownCapability() {
         val stats = DiagnosticStats()
         val session = stats.beginSession(0)

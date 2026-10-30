@@ -25,6 +25,8 @@ class VideoDecoder(
 ) {
     private var decoder: MediaCodec? = null
     @Volatile private var diagnosticCodec: MediaCodec? = null
+    @Volatile private var callbackOwnerForRelease: VendorCallbackOwner? = null
+    private val configurationHistory = diagnostics?.let { DecoderConfigurationHistory() }
     private var decoderThread: HandlerThread? = null
     private var decoderHandler: Handler? = null
 
@@ -85,6 +87,7 @@ class VideoDecoder(
         diagnosticSession = session
         // Existing decoder can survive a reconnect. Old listener closures keep their old session ID.
         diagnosticCodec?.let { codec ->
+            diagnostics?.let { configurationHistory?.replayInto(it, session) }
             recordDiagnosticCodec(codec)
             installDiagnosticListener(codec)
             try { recordDiagnosticOutputFormat(codec, codec.outputFormat) } catch (_: Exception) {}
@@ -109,7 +112,11 @@ class VideoDecoder(
     private fun recordDiagnosticOutputFormat(codec: MediaCodec, format: MediaFormat) {
         if (diagnostics == null || codec !== diagnosticCodec) return
         try {
-            diagnostics.outputSize(diagnosticSession, format.getInteger(MediaFormat.KEY_WIDTH), format.getInteger(MediaFormat.KEY_HEIGHT))
+            val keys = listOf(MediaFormat.KEY_CROP_LEFT, MediaFormat.KEY_CROP_TOP, MediaFormat.KEY_CROP_RIGHT, MediaFormat.KEY_CROP_BOTTOM)
+            val crop = if (keys.all { format.containsKey(it) }) DecoderCrop(
+                format.getInteger(keys[0]), format.getInteger(keys[1]), format.getInteger(keys[2]), format.getInteger(keys[3]),
+            ) else null
+            diagnostics.outputSize(diagnosticSession, format.getInteger(MediaFormat.KEY_WIDTH), format.getInteger(MediaFormat.KEY_HEIGHT), crop)
         } catch (_: Exception) {}
     }
 
@@ -128,7 +135,12 @@ class VideoDecoder(
         }
     }
 
+    private fun recordConfigurationStep(epoch: Long, step: DecoderConfigStep) {
+        if (configurationHistory?.record(epoch, step) == true) diagnostics?.configurationStep(diagnosticSession, step)
+    }
+
     private fun setupDecoder() {
+        val configurationEpoch = configurationHistory?.beginCodec() ?: 0L
         diagnostics?.resetDecoder(diagnosticSession, System.nanoTime())
         decoderThread = HandlerThread("DecoderThread", Process.THREAD_PRIORITY_DISPLAY).also { it.start() }
         decoderHandler = Handler(decoderThread!!.looper)
@@ -137,12 +149,20 @@ class VideoDecoder(
         val decoderName = findBestDecoder(currentWidth, currentHeight)
         diagLog("setupDecoder: ${currentWidth}x$currentHeight, decoder=$decoderName")
 
-        val codec =
+        var codec =
             if (decoderName != null) {
                 MediaCodec.createByCodecName(decoderName)
             } else {
                 MediaCodec.createDecoderByType(mime)
             }
+
+        val vendorParameters = if (BuildConfig.DIAGNOSTICS && BuildConfig.HISI_LOW_LATENCY_EXPERIMENT &&
+            Build.VERSION.SDK_INT == 29 && mime == MediaFormat.MIMETYPE_VIDEO_HEVC
+        ) HisiLowLatencyRequest.parameters(true, true, Build.VERSION.SDK_INT, codec.name, mime) else emptyMap()
+        // Never let a subsequent setup change the filtering policy captured by an older callback.
+        val callbackOwner = VendorCallbackOwner(vendorParameters.isNotEmpty())
+        callbackOwner.bind(codec)
+        callbackOwnerForRelease = callbackOwner
 
         val callback =
             object : MediaCodec.Callback() {
@@ -150,6 +170,7 @@ class VideoDecoder(
                     codec: MediaCodec,
                     index: Int,
                 ) {
+                    if (!callbackOwner.accepts(codec)) return
                     availableInputBuffers.offer(index)
                 }
 
@@ -158,6 +179,7 @@ class VideoDecoder(
                     index: Int,
                     info: MediaCodec.BufferInfo,
                 ) {
+                    if (!callbackOwner.accepts(codec)) return
                     handleOutputBuffer(codec, index, info)
                 }
 
@@ -165,6 +187,7 @@ class VideoDecoder(
                     codec: MediaCodec,
                     e: MediaCodec.CodecException,
                 ) {
+                    if (!callbackOwner.accepts(codec)) return
                     diagLog("Codec error: ${e.diagnosticInfo}")
                     Log.e(TAG, "Codec error: ${e.diagnosticInfo}", e)
                     needsKeyframe = true
@@ -175,6 +198,7 @@ class VideoDecoder(
                     codec: MediaCodec,
                     format: MediaFormat,
                 ) {
+                    if (!callbackOwner.accepts(codec)) return
                     diagLog("Output format changed: $format")
                     recordDiagnosticOutputFormat(codec, format)
                 }
@@ -189,9 +213,65 @@ class VideoDecoder(
             )
 
         var configured = false
+        var vendorStarted = false
 
+        if (vendorParameters.isNotEmpty()) {
+            val actualName = codec.name
+            recordConfigurationStep(configurationEpoch, DecoderConfigStep.VENDOR_REQUESTED)
+            try {
+                val result = HisiLowLatencyRequest.configure(codec, vendorParameters,
+                    HisiLowLatencyRequest.fullParameters(displayRefreshRate.toInt()),
+                    configure = { candidate, settings ->
+                        val vendorFormat = MediaFormat.createVideoFormat(mime, currentWidth, currentHeight)
+                        settings.forEach { (key, value) -> vendorFormat.setInteger(key, value) }
+                        candidate.configure(vendorFormat, surface, null, 0)
+                    },
+                    start = { candidate -> startConfiguredCodec(candidate) },
+                    release = { rejected ->
+                        isRunning = false
+                        decoder = null
+                        diagnosticCodec = null
+                        callbackOwner.clear()
+                        rejected.release()
+                        availableInputBuffers.clear()
+                    },
+                    recreate = {
+                        val fresh = MediaCodec.createByCodecName(actualName)
+                        try {
+                            callbackOwner.bind(fresh)
+                            fresh.setCallback(callback, decoderHandler)
+                        } catch (error: Exception) {
+                            callbackOwner.clear()
+                            try { fresh.release() } catch (_: Exception) {}
+                            throw error
+                        }
+                        fresh
+                    },
+                )
+                codec = result.codec
+                configured = result.accepted
+                vendorStarted = result.accepted
+                recordConfigurationStep(configurationEpoch, when {
+                    result.accepted -> DecoderConfigStep.VENDOR_ACCEPTED
+                    result.failure == VendorFailure.START -> DecoderConfigStep.VENDOR_START_FAILED_REBUILT
+                    else -> DecoderConfigStep.VENDOR_CONFIGURE_FAILED_REBUILT
+                })
+            } catch (error: Exception) {
+                recordConfigurationStep(configurationEpoch, DecoderConfigStep.VENDOR_RECOVERY_FAILED)
+                configurationHistory?.release()
+                callbackOwner.clear()
+                try { codec.release() } catch (_: Exception) {}
+                availableInputBuffers.clear()
+                decoderThread?.quitSafely()
+                decoderThread = null
+                decoderHandler = null
+                throw error
+            }
+        } else recordConfigurationStep(configurationEpoch, DecoderConfigStep.VENDOR_INELIGIBLE)
+
+        // Existing standard fallback format has never contained vendor keys.
         // Attempt 1: Full low-latency config
-        try {
+        if (!configured) try {
             format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
             format.setInteger(MediaFormat.KEY_PRIORITY, 0)
             format.setInteger(MediaFormat.KEY_OPERATING_RATE, displayRefreshRate.toInt())
@@ -199,8 +279,10 @@ class VideoDecoder(
             codec.configure(format, surface, null, 0)
             configured = true
             diagLog("Configured with full low-latency")
+            recordConfigurationStep(configurationEpoch, DecoderConfigStep.FULL_ACCEPTED)
         } catch (e: Exception) {
             diagLog("Full low-latency config failed: ${e.message}")
+            recordConfigurationStep(configurationEpoch, DecoderConfigStep.FULL_REJECTED)
             codec.reset()
             codec.setCallback(callback, decoderHandler)
         }
@@ -219,8 +301,10 @@ class VideoDecoder(
                 codec.configure(basicFormat, surface, null, 0)
                 configured = true
                 diagLog("Configured with basic format")
+                recordConfigurationStep(configurationEpoch, DecoderConfigStep.BASIC_ACCEPTED)
             } catch (e: Exception) {
                 diagLog("Basic config failed: ${e.message}")
+                recordConfigurationStep(configurationEpoch, DecoderConfigStep.BASIC_REJECTED)
                 codec.reset()
                 codec.setCallback(callback, decoderHandler)
             }
@@ -237,8 +321,11 @@ class VideoDecoder(
                     )
                 codec.configure(minimalFormat, surface, null, 0)
                 diagLog("Configured with minimal format")
+                recordConfigurationStep(configurationEpoch, DecoderConfigStep.MINIMAL_ACCEPTED)
             } catch (e: Exception) {
                 diagLog("All configure attempts failed: ${e.message}")
+                recordConfigurationStep(configurationEpoch, DecoderConfigStep.MINIMAL_REJECTED)
+                configurationHistory?.release()
                 Log.e(TAG, "All configure attempts failed", e)
                 codec.release()
                 decoderThread?.quitSafely()
@@ -248,6 +335,15 @@ class VideoDecoder(
             }
         }
 
+        // Vendor success already completed the same start sequence inside the recoverable trial.
+        if (!vendorStarted) startConfiguredCodec(codec)
+        diagLog(
+            "Decoder started: ${currentWidth}x$currentHeight @ ${displayRefreshRate}Hz, " +
+                "surface=$surface, valid=${surface.isValid}",
+        )
+    }
+
+    private fun startConfiguredCodec(codec: MediaCodec) {
         codec.setVideoScalingMode(MediaCodec.VIDEO_SCALING_MODE_SCALE_TO_FIT)
         if (diagnostics != null) {
             diagnosticCodec = codec
@@ -258,10 +354,6 @@ class VideoDecoder(
         isRunning = true
         codec.start()
         decoder = codec
-        diagLog(
-            "Decoder started: ${currentWidth}x$currentHeight @ ${displayRefreshRate}Hz, " +
-                "surface=$surface, valid=${surface.isValid}",
-        )
     }
 
     /**
@@ -482,11 +574,12 @@ class VideoDecoder(
         index: Int,
         info: MediaCodec.BufferInfo,
     ) {
+        val diagnosticOutputNs = if (diagnostics != null) System.nanoTime() else 0L
         try {
             outputFrameCount++
             diagnostics?.let { stats ->
                 val session = diagnosticSession
-                if (codec === diagnosticCodec) stats.output(session, info.presentationTimeUs)
+                if (codec === diagnosticCodec) stats.output(session, info.presentationTimeUs, diagnosticOutputNs)
             }
             if (outputFrameCount == 1L) {
                 diagLog("First output frame! size=${info.size}, flags=${info.flags}")
@@ -539,7 +632,11 @@ class VideoDecoder(
 
             val handoffNs = if (diagnostics != null) System.nanoTime() else 0L
             codec.releaseOutputBuffer(index, true)
-            if (codec === diagnosticCodec) diagnostics?.handedToSurface(diagnosticSession, info.presentationTimeUs, handoffNs)
+            val releaseReturnedNs = if (diagnostics != null) System.nanoTime() else 0L
+            if (codec === diagnosticCodec) diagnostics?.let { stats ->
+                stats.handedToSurface(diagnosticSession, info.presentationTimeUs, handoffNs)
+                stats.released(diagnosticSession, info.presentationTimeUs, handoffNs, releaseReturnedNs)
+            }
             trackFrameTiming(System.nanoTime())
             updateStats()
         } catch (e: Exception) {
@@ -580,6 +677,9 @@ class VideoDecoder(
     }
 
     fun release() {
+        callbackOwnerForRelease?.clear()
+        callbackOwnerForRelease = null
+        configurationHistory?.release()
         diagnosticCodec = null
         isRunning = false
         try {

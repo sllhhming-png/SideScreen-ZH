@@ -18,6 +18,7 @@ android {
         versionCode = computedVersionCode
         versionName = appVersion
         buildConfigField("boolean", "DIAGNOSTICS", "false")
+        buildConfigField("boolean", "HISI_LOW_LATENCY_EXPERIMENT", "false")
     }
 
     buildTypes {
@@ -25,9 +26,10 @@ android {
             initWith(getByName("debug"))
             isDebuggable = false
             applicationIdSuffix = ".cn.diag"
-            versionNameSuffix = "-cn-diag"
+            versionNameSuffix = "-cn-diag2"
             resValue("string", "app_name", "Side Screen 中文诊断")
             buildConfigField("boolean", "DIAGNOSTICS", "true")
+            buildConfigField("boolean", "HISI_LOW_LATENCY_EXPERIMENT", "true")
             // Review/signing is owned by the controller; never use a private release key here.
             signingConfig = null
             matchingFallbacks += listOf("debug")
@@ -69,4 +71,10 @@ dependencies {
     implementation("com.google.mlkit:barcode-scanning:17.2.0")
 
     testImplementation("junit:junit:4.13.2")
+}
+
+androidComponents {
+    onVariants(selector().withBuildType("diagnostic")) { variant ->
+        variant.outputs.forEach { it.versionCode.set(1002) }
+    }
 }

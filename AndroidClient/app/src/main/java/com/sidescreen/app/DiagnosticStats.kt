@@ -12,20 +12,31 @@ data class DiagnosticSnapshot(
     val width: Int?, val height: Int?,
     val handoff: DelaySummary?, val presentation: DelaySummary?,
     val sessionId: Long = 0, val ended: Boolean = false,
+    val outputDelay: DelaySummary? = null, val releaseCall: DelaySummary? = null, val afterSurface: DelaySummary? = null, val crop: DecoderCrop? = null,
+    val configuration: List<DecoderConfigStep> = emptyList(),
 ) {
     /** Allowlist only: never append MediaFormat, exceptions, connection data or existing logs. */
-    fun text(androidVersion: String, api: Int): String = buildString {
+    fun text(androidVersion: String, api: Int, appVersion: String = "unknown"): String = buildString {
         appendLine("Side Screen 中文诊断（非延迟修复/验收）")
+        appendLine("应用版本: $appVersion")
         appendLine("Android $androidVersion / API $api")
         appendLine("会话: ${if (sessionId == 0L) "未开始（unknown）" else "#$sessionId " + if (ended) "已断开（保留最后汇总）" else "采集中（连接尝试 / 串流）"}")
         appendLine("重连会开始新会话并清空旧汇总，请先复制；仅当前进程内存保留，退出后不保留。")
         appendLine("实际 codec: ${codecName ?: "unknown"}")
+        appendLine("配置尝试: ${configuration.takeIf { it.isNotEmpty() }?.joinToString(" → ") ?: "unknown"}")
+        appendLine("VENDOR_ACCEPTED 仅表示配置与启动成功；其他 ACCEPTED 表示配置被接受。硬件效果未经验证，API29 标准 low-latency 不保证生效。")
         appendLine("硬件加速: ${hardware?.toString() ?: "unknown（API 29 前不推断）"}")
         appendLine("该 codec 能力查询 2000×1200@60: ${supportsTarget?.toString() ?: "unknown"}（能力声明不等于实测）")
         appendLine("输出格式像素尺寸: ${if (width != null && height != null) "${width}×$height" else "unknown"}")
+        val effective = if (width != null && height != null) crop?.effectiveSize(width, height) else null
+        appendLine("crop(left,top,right,bottom): ${crop?.let { "${it.left},${it.top},${it.right},${it.bottom}" } ?: "unknown"}; 有效尺寸: ${effective?.let { "${it.first}×${it.second}" } ?: "unknown"}")
         appendLine("本连接累计完整收帧=$received；当前解码器: 入 codec=$inputs / 输出缓冲=$outputs / 交给 Surface=$handoffs")
+        appendLine("本机完整收帧→输出回调入口（筛选前，含未交 Surface 的输出）: ${format(outputDelay)}")
+        appendLine("releaseOutputBuffer(render=true) 调用耗时: ${format(releaseCall)}")
         appendLine("本机完整收帧→交给 Surface: ${format(handoff)}")
         appendLine("本机完整收帧→呈现回调携带时刻（仅实际回调样本）: ${format(presentation)}")
+        appendLine("交给 Surface→呈现携带时刻（同 PTS 逐帧相减）: ${format(afterSurface)}")
+        appendLine("Surface 样本受现有 100ms 丢弃策略筛选；呈现仅匹配当前 handoff 窗口，不能用分位数相减。")
         appendLine("延迟样本仅保留最近最多 240 帧；PTS 为本机收帧完成时间（微秒精度），交给 Surface 时刻取 render=true 释放调用前；不含采集、编码、网络。")
         appendLine("呈现回调完整性 / 完整呈现 FPS / 冻结: unknown（未验证全帧覆盖）")
         appendLine("呈现使用回调 nanoTime；Android 14 前可能缺回调，其他版本也需实机核对。缺回调保持 unknown，回调样本不能当完整呈现 FPS、冻结或端到端延迟。")
@@ -52,6 +63,10 @@ class DiagnosticStats(private val capacity: Int = 240) {
     private var supportsTarget: Boolean? = null
     private var width: Int? = null
     private var height: Int? = null
+    private var crop: DecoderCrop? = null
+    private val configuration = ArrayList<DecoderConfigStep>(8)
+    private val outputTimes = TreeMap<Long, Long>()
+    private val releaseDurations = TreeMap<Long, Long>()
     private val handoffTimes = TreeMap<Long, Long>()
     private val presentation = PresentationSamples(capacity)
     private var evictedThroughUs = Long.MIN_VALUE
@@ -62,6 +77,10 @@ class DiagnosticStats(private val capacity: Int = 240) {
         this.startNs = startNs
         received = 0; inputs = 0; outputs = 0; handoffs = 0
         codecName = null; hardware = null; supportsTarget = null; width = null; height = null
+        crop = null
+        configuration.clear()
+        outputTimes.clear()
+        releaseDurations.clear()
         handoffTimes.clear()
         presentation.reset()
         evictedThroughUs = Long.MIN_VALUE
@@ -73,6 +92,10 @@ class DiagnosticStats(private val capacity: Int = 240) {
         this.startNs = maxOf(this.startNs, startNs)
         inputs = 0; outputs = 0; handoffs = 0
         codecName = null; hardware = null; supportsTarget = null; width = null; height = null
+        crop = null
+        configuration.clear()
+        outputTimes.clear()
+        releaseDurations.clear()
         handoffTimes.clear()
         presentation.reset()
         evictedThroughUs = Long.MIN_VALUE
@@ -86,8 +109,10 @@ class DiagnosticStats(private val capacity: Int = 240) {
     @Synchronized fun input(session: Long, ptsUs: Long) {
         if (accepts(session, ptsUs)) inputs++
     }
-    @Synchronized fun output(session: Long, ptsUs: Long) {
-        if (accepts(session, ptsUs)) outputs++
+    @Synchronized fun output(session: Long, ptsUs: Long, outputNs: Long? = null) {
+        if (!accepts(session, ptsUs)) return
+        outputs++
+        if (outputNs != null && outputNs >= ptsUs * 1000) putBounded(outputTimes, ptsUs, outputNs)
     }
 
     @Synchronized fun codec(session: Long, name: String, hardware: Boolean?, supportsTarget: Boolean?) {
@@ -97,9 +122,9 @@ class DiagnosticStats(private val capacity: Int = 240) {
         this.supportsTarget = supportsTarget
     }
 
-    @Synchronized fun outputSize(session: Long, width: Int, height: Int) {
+    @Synchronized fun outputSize(session: Long, width: Int, height: Int, crop: DecoderCrop? = null) {
         if (session != this.session || session == 0L || ended || width <= 0 || height <= 0) return
-        this.width = width; this.height = height
+        this.width = width; this.height = height; this.crop = crop
     }
 
     @Synchronized private fun accepts(session: Long, ptsUs: Long): Boolean =
@@ -114,6 +139,21 @@ class DiagnosticStats(private val capacity: Int = 240) {
         if (handoffTimes.size > capacity) evictedThroughUs = maxOf(evictedThroughUs, handoffTimes.pollFirstEntry()!!.key)
     }
 
+    @Synchronized fun released(session: Long, ptsUs: Long, startNs: Long, endNs: Long) {
+        if (!accepts(session, ptsUs) || handoffTimes[ptsUs] != startNs || endNs < startNs) return
+        putBounded(releaseDurations, ptsUs, endNs - startNs)
+    }
+
+    @Synchronized fun configurationStep(session: Long, step: DecoderConfigStep) {
+        if (session != this.session || session == 0L || ended) return
+        if (configuration.size < 8) configuration.add(step)
+    }
+
+    private fun putBounded(map: TreeMap<Long, Long>, ptsUs: Long, value: Long) {
+        if (!map.containsKey(ptsUs)) map[ptsUs] = value
+        if (map.size > capacity) map.pollFirstEntry()
+    }
+
     @Synchronized fun presented(session: Long, ptsUs: Long, renderedNs: Long) {
         if (!accepts(session, ptsUs)) return
         val handoffNs = handoffTimes[ptsUs] ?: return
@@ -121,12 +161,19 @@ class DiagnosticStats(private val capacity: Int = 240) {
         presentation.record(presentation.generation(), ptsUs, renderedNs)
     }
 
-    @Synchronized fun snapshot(): DiagnosticSnapshot = DiagnosticSnapshot(
-        received, inputs, outputs, handoffs, codecName, hardware, supportsTarget, width, height,
-        summarize(handoffTimes.map { (pts, handoff) -> handoff - pts * 1000 }),
-        summarize(presentation.snapshot().map { it.renderedNs - it.presentationTimeUs * 1000 }),
-        session, ended,
-    )
+    @Synchronized fun snapshot(): DiagnosticSnapshot {
+        val matched = presentation.snapshot().filter { handoffTimes.containsKey(it.presentationTimeUs) }
+        return DiagnosticSnapshot(
+            received, inputs, outputs, handoffs, codecName, hardware, supportsTarget, width, height,
+            summarize(handoffTimes.map { (pts, handoff) -> handoff - pts * 1000 }),
+            summarize(matched.map { it.renderedNs - it.presentationTimeUs * 1000 }),
+            session, ended,
+            summarize(outputTimes.map { (pts, output) -> output - pts * 1000 }),
+            summarize(releaseDurations.filterKeys { handoffTimes.containsKey(it) }.values.toList()),
+            summarize(matched.map { it.renderedNs - handoffTimes.getValue(it.presentationTimeUs) }),
+            crop, configuration.toList(),
+        )
+    }
 
     private fun summarize(values: List<Long>): DelaySummary? {
         if (values.isEmpty()) return null
