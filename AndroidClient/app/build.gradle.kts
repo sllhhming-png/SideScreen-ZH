@@ -26,7 +26,7 @@ android {
             initWith(getByName("debug"))
             isDebuggable = false
             applicationIdSuffix = ".cn.diag"
-            versionNameSuffix = "-cn-diag2"
+            versionNameSuffix = "-cn-diag3"
             resValue("string", "app_name", "Side Screen 中文诊断")
             buildConfigField("boolean", "DIAGNOSTICS", "true")
             buildConfigField("boolean", "HISI_LOW_LATENCY_EXPERIMENT", "true")
@@ -75,6 +75,6 @@ dependencies {
 
 androidComponents {
     onVariants(selector().withBuildType("diagnostic")) { variant ->
-        variant.outputs.forEach { it.versionCode.set(1002) }
+        variant.outputs.forEach { it.versionCode.set(1003) }
     }
 }

@@ -496,7 +496,7 @@ class StreamClient(
 
         // Capture timestamp after full frame received for accurate age tracking.
         val receiveTimestamp = System.nanoTime()
-        diagnostics?.received(diagnosticSession)
+        diagnostics?.received(diagnosticSession, receiveTimestamp)
         checkKeyframeFreshness(receiveTimestamp, isKeyframe)
         diagFrameCount++
         if (diagFrameCount == 1L) {

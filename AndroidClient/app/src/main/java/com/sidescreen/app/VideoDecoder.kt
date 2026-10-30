@@ -25,6 +25,7 @@ class VideoDecoder(
 ) {
     private var decoder: MediaCodec? = null
     @Volatile private var diagnosticCodec: MediaCodec? = null
+    @Volatile private var diagnosticObservationEpoch = 0L
     @Volatile private var callbackOwnerForRelease: VendorCallbackOwner? = null
     private val configurationHistory = diagnostics?.let { DecoderConfigurationHistory() }
     private var decoderThread: HandlerThread? = null
@@ -85,6 +86,7 @@ class VideoDecoder(
 
     fun setDiagnosticSession(session: Long) {
         diagnosticSession = session
+        diagnosticObservationEpoch = diagnostics?.observationEpoch(session) ?: 0L
         // Existing decoder can survive a reconnect. Old listener closures keep their old session ID.
         diagnosticCodec?.let { codec ->
             diagnostics?.let { configurationHistory?.replayInto(it, session) }
@@ -123,11 +125,13 @@ class VideoDecoder(
     private fun installDiagnosticListener(codec: MediaCodec) {
         val stats = diagnostics ?: return
         val session = diagnosticSession
+        val observationEpoch = diagnosticObservationEpoch
         try {
             codec.setOnFrameRenderedListener({ renderedCodec, presentationTimeUs, nanoTime ->
-                if (renderedCodec === diagnosticCodec && session == diagnosticSession) {
+                val arrivalNs = System.nanoTime() // first statement at listener entry; listener exists only on the diagnostic path.
+                if (renderedCodec === diagnosticCodec && session == diagnosticSession && observationEpoch == diagnosticObservationEpoch) {
                     // Use the event's actual timestamp, never callback arrival System.nanoTime().
-                    stats.presented(session, presentationTimeUs, nanoTime)
+                    stats.presented(session, presentationTimeUs, nanoTime, arrivalNs, observationEpoch)
                 }
             }, decoderHandler)
         } catch (_: Exception) {
@@ -141,7 +145,7 @@ class VideoDecoder(
 
     private fun setupDecoder() {
         val configurationEpoch = configurationHistory?.beginCodec() ?: 0L
-        diagnostics?.resetDecoder(diagnosticSession, System.nanoTime())
+        diagnosticObservationEpoch = diagnostics?.resetDecoder(diagnosticSession, System.nanoTime()) ?: 0L
         decoderThread = HandlerThread("DecoderThread", Process.THREAD_PRIORITY_DISPLAY).also { it.start() }
         decoderHandler = Handler(decoderThread!!.looper)
 
@@ -440,7 +444,10 @@ class VideoDecoder(
         frameTimestamp: Long = System.nanoTime(),
         isKeyframe: Boolean = false,
     ) {
+        val inputSession = diagnosticSession
+        val inputEpoch = diagnosticObservationEpoch
         if (!isRunning) {
+            diagnostics?.notQueued(inputSession,frameTimestamp / 1000,InputNotQueuedReason.NOT_RUNNING,inputEpoch)
             diagLog("decode called but isRunning=false")
             onFrameDecoded?.invoke(frameData)
             return
@@ -466,12 +473,14 @@ class VideoDecoder(
 
         val codec =
             decoder ?: run {
+                diagnostics?.notQueued(inputSession,frameTimestamp / 1000,InputNotQueuedReason.CODEC_MISSING,inputEpoch)
                 diagLog("decoder is null in decode()")
                 onFrameDecoded?.invoke(frameData)
                 return
             }
 
         if (needsKeyframe && !isKeyframe) {
+            diagnostics?.notQueued(inputSession,frameTimestamp / 1000,InputNotQueuedReason.WAITING_KEYFRAME,inputEpoch)
             dropFrame(
                 frameData,
                 isKeyframe,
@@ -484,6 +493,7 @@ class VideoDecoder(
         // Direct feed: grab an available input buffer and queue immediately.
         val index = availableInputBuffers.poll()
         if (index == null) {
+            diagnostics?.notQueued(inputSession,frameTimestamp / 1000,InputNotQueuedReason.NO_INPUT_BUFFER,inputEpoch)
             // Decoder input pool exhausted (typically a WiFi burst saturating
             // MediaCodec). Do NOT pause the pipeline — keep feeding so the
             // cursor tracks live. Reference state diverges briefly (cursor
@@ -500,7 +510,7 @@ class VideoDecoder(
             return
         }
 
-        queueFrame(codec, index, frameData, frameSize, frameTimestamp, isKeyframe)
+        queueFrame(codec, index, frameData, frameSize, frameTimestamp, isKeyframe, inputSession, inputEpoch)
     }
 
     private fun queueFrame(
@@ -510,6 +520,8 @@ class VideoDecoder(
         frameSize: Int,
         frameTimestamp: Long,
         isKeyframe: Boolean,
+        inputSession: Long,
+        inputEpoch: Long,
     ) {
         try {
             val inputBuffer =
@@ -519,13 +531,13 @@ class VideoDecoder(
             inputBuffer.put(frameData, 0, frameSize)
             codec.queueInputBuffer(index, 0, frameSize, frameTimestamp / 1000, 0)
             diagnostics?.let { stats ->
-                val session = diagnosticSession
-                stats.input(session, frameTimestamp / 1000)
+                stats.input(inputSession, frameTimestamp / 1000, inputEpoch)
             }
             if (isKeyframe) {
                 needsKeyframe = false
             }
         } catch (e: Exception) {
+            diagnostics?.notQueued(inputSession,frameTimestamp / 1000,InputNotQueuedReason.QUEUE_EXCEPTION,inputEpoch)
             needsKeyframe = true
             requestKeyframe("queue input failed")
             Log.e(TAG, "decode direct feed error", e)
@@ -575,11 +587,12 @@ class VideoDecoder(
         info: MediaCodec.BufferInfo,
     ) {
         val diagnosticOutputNs = if (diagnostics != null) System.nanoTime() else 0L
+        val outputSession = diagnosticSession
+        val outputEpoch = diagnosticObservationEpoch
         try {
             outputFrameCount++
             diagnostics?.let { stats ->
-                val session = diagnosticSession
-                if (codec === diagnosticCodec) stats.output(session, info.presentationTimeUs, diagnosticOutputNs)
+                if (codec === diagnosticCodec) stats.output(outputSession, info.presentationTimeUs, diagnosticOutputNs, outputEpoch)
             }
             if (outputFrameCount == 1L) {
                 diagLog("First output frame! size=${info.size}, flags=${info.flags}")
@@ -617,6 +630,7 @@ class VideoDecoder(
                     latencyNs <= MAX_RENDER_LATENCY_NS
 
             if (!shouldRender) {
+                if (codec === diagnosticCodec) diagnostics?.staleOutput(outputSession,info.presentationTimeUs,outputEpoch)
                 droppedFrames++
                 staleOutputDrops++
                 if (staleOutputDrops <= 3L || staleOutputDrops % 60L == 0L) {
@@ -634,8 +648,8 @@ class VideoDecoder(
             codec.releaseOutputBuffer(index, true)
             val releaseReturnedNs = if (diagnostics != null) System.nanoTime() else 0L
             if (codec === diagnosticCodec) diagnostics?.let { stats ->
-                stats.handedToSurface(diagnosticSession, info.presentationTimeUs, handoffNs)
-                stats.released(diagnosticSession, info.presentationTimeUs, handoffNs, releaseReturnedNs)
+                stats.handedToSurface(outputSession, info.presentationTimeUs, handoffNs, outputEpoch)
+                stats.released(outputSession, info.presentationTimeUs, handoffNs, releaseReturnedNs, outputEpoch)
             }
             trackFrameTiming(System.nanoTime())
             updateStats()

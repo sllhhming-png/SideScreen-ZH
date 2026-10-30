@@ -52,6 +52,7 @@ class MainActivity : AppCompatActivity() {
     private val diagnostics = if (BuildConfig.DIAGNOSTICS) DiagnosticStats() else null
     private val diagnosticAttempts = diagnostics?.let { DiagnosticAttempts(it) }
     @Volatile private var diagnosticSession = 0L
+    @Volatile private var preSettingsDiagnosticSnapshot: DiagnosticSnapshot? = null
     private var currentSurfaceHolder: SurfaceHolder? = null
     private var displayWidth = 0 // 0 = no config received yet
     private var displayHeight = 0 // 0 = no config received yet
@@ -479,6 +480,7 @@ class MainActivity : AppCompatActivity() {
 
     @SuppressLint("InflateParams", "SetTextI18n")
     private fun showSettingsDialog() {
+        preSettingsDiagnosticSnapshot = diagnostics?.snapshot() // freeze before creating/showing the settings window.
         val dialog = Dialog(this)
         dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
         dialog.setContentView(R.layout.dialog_settings)
@@ -494,7 +496,7 @@ class MainActivity : AppCompatActivity() {
         val closeButton = view.findViewById<View>(R.id.closeButton)
         val diagnosticButton = view.findViewById<View>(R.id.diagnosticSettingsButton)
         diagnosticButton.visibility = if (BuildConfig.DIAGNOSTICS) View.VISIBLE else View.GONE
-        diagnosticButton.setOnClickListener { showDiagnosticDialog() }
+        diagnosticButton.setOnClickListener { showDiagnosticDialog(fromSettings = true) }
 
         // Only show Disconnect when actually streaming. Otherwise the button is
         // a no-op and confuses users into clicking it twice.
@@ -642,6 +644,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun beginDiagnosticSession(): Long? {
+        preSettingsDiagnosticSnapshot = null
         val attempts = diagnosticAttempts ?: return 0L
         val id = attempts.begin(System.nanoTime()) { localId ->
             diagnosticSession = localId
@@ -660,13 +663,14 @@ class MainActivity : AppCompatActivity() {
 
     private fun diagnosticCallbackIsCurrent(session: Long): Boolean = diagnosticAttempts?.isCurrent(session) ?: true
 
-    private fun diagnosticText(stats: DiagnosticStats): String =
-        stats.snapshot().text(Build.VERSION.RELEASE, Build.VERSION.SDK_INT, "${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})") +
-            "\n本进程已拒绝重叠连接尝试: ${diagnosticAttempts?.rejectedCount() ?: 0}（未启动第二连接）"
+    private fun diagnosticText(choice: DiagnosticSnapshotChoice): String =
+        choice.origin.label + "\n" + choice.snapshot.text(Build.VERSION.RELEASE, Build.VERSION.SDK_INT, "${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})") +
+            "\n当前本进程已拒绝重叠连接尝试: ${diagnosticAttempts?.rejectedCount() ?: 0}（非快照字段；未启动第二连接）"
 
-    private fun showDiagnosticDialog() {
+    private fun showDiagnosticDialog(fromSettings: Boolean = false) {
         val stats = diagnostics ?: return
-        var text = diagnosticText(stats)
+        val choice = DiagnosticSnapshotSelection.choose(stats.snapshot(),preSettingsDiagnosticSnapshot,fromSettings)
+        var text = diagnosticText(choice)
         val dialog = android.app.AlertDialog.Builder(this)
             .setTitle("中文诊断（本机局部指标）")
             .setMessage(text)
@@ -679,7 +683,7 @@ class MainActivity : AppCompatActivity() {
             .create()
         dialog.show()
         dialog.getButton(android.app.AlertDialog.BUTTON_NEUTRAL).setOnClickListener {
-            text = diagnosticText(stats)
+            text = diagnosticText(DiagnosticSnapshotSelection.choose(stats.snapshot(),null,false,refreshing = true))
             dialog.setMessage(text)
         }
         dialog.findViewById<TextView>(android.R.id.message)?.setTextIsSelectable(true)
