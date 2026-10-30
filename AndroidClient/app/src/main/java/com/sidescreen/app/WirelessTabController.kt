@@ -96,6 +96,20 @@ class WirelessTabController(
         transition(State.PAIRED_IDLE)
     }
 
+    /** Restore only the diagnostic request UI after its overlap gate rejected a second request. */
+    fun onDiagnosticAttemptRejected(state: DiagnosticRejectedUiState) {
+        if (!BuildConfig.DIAGNOSTICS) return
+        when (state) {
+            DiagnosticRejectedUiState.IDLE -> onStreamDisconnected()
+            DiagnosticRejectedUiState.CONNECTED -> transition(State.CONNECTED)
+            DiagnosticRejectedUiState.CONNECTING -> {
+                views.connectingLabel.text = "正在等待当前诊断连接"
+                views.connectingSubtitle.text = "重复请求已拒绝，请等待当前尝试结束"
+                transition(State.CONNECTING)
+            }
+        }
+    }
+
     private fun transition(next: State) {
         android.util.Log.i("WirelessTabController", "transition $state → $next")
         state = next

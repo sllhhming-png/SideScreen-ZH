@@ -33,6 +33,8 @@ import com.google.android.material.slider.Slider
 import com.google.android.material.switchmaterial.SwitchMaterial
 import com.sidescreen.app.databinding.ActivityMainBinding
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.launch
 import java.net.InetSocketAddress
 import java.net.Socket
@@ -47,6 +49,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var prefs: PreferencesManager
     private var videoDecoder: VideoDecoder? = null
     private var streamClient: StreamClient? = null
+    private val diagnostics = if (BuildConfig.DIAGNOSTICS) DiagnosticStats() else null
+    private val diagnosticAttempts = diagnostics?.let { DiagnosticAttempts(it) }
+    @Volatile private var diagnosticSession = 0L
     private var currentSurfaceHolder: SurfaceHolder? = null
     private var displayWidth = 0 // 0 = no config received yet
     private var displayHeight = 0 // 0 = no config received yet
@@ -318,6 +323,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupUI() {
+        binding.diagnosticHomeButton.visibility = if (BuildConfig.DIAGNOSTICS) View.VISIBLE else View.GONE
+        binding.diagnosticHomeButton.setOnClickListener { showDiagnosticDialog() }
         binding.connectButton.setOnClickListener {
             var host =
                 binding.hostInput.text
@@ -485,6 +492,9 @@ class MainActivity : AppCompatActivity() {
         val resetSettingsBtn = view.findViewById<View>(R.id.resetSettingsButton)
         val disconnectButton = view.findViewById<View>(R.id.disconnectSettingsButton)
         val closeButton = view.findViewById<View>(R.id.closeButton)
+        val diagnosticButton = view.findViewById<View>(R.id.diagnosticSettingsButton)
+        diagnosticButton.visibility = if (BuildConfig.DIAGNOSTICS) View.VISIBLE else View.GONE
+        diagnosticButton.setOnClickListener { showDiagnosticDialog() }
 
         // Only show Disconnect when actually streaming. Otherwise the button is
         // a no-op and confuses users into clicking it twice.
@@ -629,6 +639,50 @@ class MainActivity : AppCompatActivity() {
             val maxH = (resources.displayMetrics.heightPixels * 0.85).toInt()
             win.setLayout(WindowManager.LayoutParams.MATCH_PARENT, maxH)
         }
+    }
+
+    private fun beginDiagnosticSession(): Long? {
+        val attempts = diagnosticAttempts ?: return 0L
+        val id = attempts.begin(System.nanoTime()) { localId ->
+            diagnosticSession = localId
+            videoDecoder?.setDiagnosticSession(localId)
+        }
+        if (id == null) runOnUiThread {
+            attempts.restoreRejectedUi { state ->
+                if (prefs.connectionMode == ConnectionMode.WIRELESS) {
+                    wirelessController.onDiagnosticAttemptRejected(state)
+                }
+            }
+            showError("诊断版已拒绝重叠连接尝试，未启动第二连接。请等待当前连接及清理结束后重试。")
+        }
+        return id
+    }
+
+    private fun diagnosticCallbackIsCurrent(session: Long): Boolean = diagnosticAttempts?.isCurrent(session) ?: true
+
+    private fun diagnosticText(stats: DiagnosticStats): String =
+        stats.snapshot().text(Build.VERSION.RELEASE, Build.VERSION.SDK_INT) +
+            "\n本进程已拒绝重叠连接尝试: ${diagnosticAttempts?.rejectedCount() ?: 0}（未启动第二连接）"
+
+    private fun showDiagnosticDialog() {
+        val stats = diagnostics ?: return
+        var text = diagnosticText(stats)
+        val dialog = android.app.AlertDialog.Builder(this)
+            .setTitle("中文诊断（本机局部指标）")
+            .setMessage(text)
+            .setPositiveButton("复制以上诊断") { _, _ ->
+                val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Side Screen 中文诊断", text))
+            }
+            .setNeutralButton("刷新", null)
+            .setNegativeButton("关闭", null)
+            .create()
+        dialog.show()
+        dialog.getButton(android.app.AlertDialog.BUTTON_NEUTRAL).setOnClickListener {
+            text = diagnosticText(stats)
+            dialog.setMessage(text)
+        }
+        dialog.findViewById<TextView>(android.R.id.message)?.setTextIsSelectable(true)
     }
 
     private fun updateSettingsButtonOpacity(opacity: Float) {
@@ -805,7 +859,7 @@ class MainActivity : AppCompatActivity() {
                 } else {
                     MediaFormat.MIMETYPE_VIDEO_HEVC
                 }
-            videoDecoder = VideoDecoder(holder.surface, displayObj, displayWidth, displayHeight, mime)
+            videoDecoder = VideoDecoder(holder.surface, displayObj, displayWidth, displayHeight, mime, diagnostics, diagnosticSession)
             // Wire up buffer release callback
             videoDecoder?.onFrameDecoded = { buffer ->
                 streamClient?.releaseBuffer(buffer)
@@ -828,8 +882,12 @@ class MainActivity : AppCompatActivity() {
     /**
      * Wire up all StreamClient callbacks. Used by both USB connect() and wireless connectWireless().
      */
-    private fun setupStreamClientCallbacks() {
-        streamClient?.onFrameReceived = { frameData, frameSize, timestamp, isKeyframe ->
+    private fun setupStreamClientCallbacks(client: StreamClient, callbackSession: Long) {
+        client.onFrameReceived = frame@ { frameData, frameSize, timestamp, isKeyframe ->
+            if (!diagnosticCallbackIsCurrent(callbackSession)) {
+                client.releaseBuffer(frameData)
+                return@frame
+            }
             val dec = videoDecoder
             if (dec != null) {
                 dec.decode(frameData, frameSize, timestamp, isKeyframe)
@@ -839,17 +897,21 @@ class MainActivity : AppCompatActivity() {
         }
 
         videoDecoder?.onFrameDecoded = { buffer ->
-            streamClient?.releaseBuffer(buffer)
+            client.releaseBuffer(buffer)
         }
 
-        streamClient?.onLatencyMeasured = { rttMs ->
+        client.onLatencyMeasured = { rttMs ->
             runOnUiThread {
+                if (!diagnosticCallbackIsCurrent(callbackSession)) return@runOnUiThread
                 binding.latencyText.text = String.format("%.1f ms", rttMs)
             }
         }
 
-        streamClient?.onConnectionStatus = { connected ->
+        client.onConnectionStatus = status@ { connected ->
+            if (!diagnosticCallbackIsCurrent(callbackSession)) return@status
+            diagnosticAttempts?.connectionStatus(callbackSession, connected)
             runOnUiThread {
+                if (!diagnosticCallbackIsCurrent(callbackSession)) return@runOnUiThread
                 isConnected = connected
                 if (connected) {
                     updateStatus("已连接，正在显示画面")
@@ -905,7 +967,8 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        streamClient?.onDisplaySize = { width, height, rotation ->
+        client.onDisplaySize = display@ { width, height, rotation ->
+            if (!diagnosticCallbackIsCurrent(callbackSession)) return@display
             mainDiag("onDisplaySize: ${width}x$height @ $rotation°")
             warnIfAvcOnlyWithoutNegotiation()
             displayWidth = width
@@ -918,6 +981,7 @@ class MainActivity : AppCompatActivity() {
                 if (holder != null && holder.surface.isValid) {
                     mainDiag("Display config arrived, initializing decoder ${width}x$height")
                     runOnUiThread {
+                        if (!diagnosticCallbackIsCurrent(callbackSession)) return@runOnUiThread
                         if (videoDecoder == null) {
                             initializeDecoder(holder)
                         }
@@ -927,14 +991,16 @@ class MainActivity : AppCompatActivity() {
                 }
             }
             runOnUiThread {
+                if (!diagnosticCallbackIsCurrent(callbackSession)) return@runOnUiThread
                 binding.resolutionText.text = "${width}x$height"
                 applyRotation(rotation)
             }
             log("Display: ${width}x$height @ $rotation°")
         }
 
-        streamClient?.onStats = { fps, mbps ->
+        client.onStats = { fps, mbps ->
             runOnUiThread {
+                if (!diagnosticCallbackIsCurrent(callbackSession)) return@runOnUiThread
                 binding.fpsText.text = String.format("%.1f", fps)
                 binding.bitrateText.text = String.format("%.1f Mbps", mbps)
             }
@@ -949,23 +1015,35 @@ class MainActivity : AppCompatActivity() {
         macName: String,
     ) {
         lifecycleScope.launch(Dispatchers.IO) {
+            var attemptSession = 0L
             try {
                 log("Connecting wirelessly to $host:$port...")
-                streamClient = StreamClient(host, port, applicationContext)
-                setupStreamClientCallbacks()
-                streamClient?.connectWireless(token, deviceName)
+                attemptSession = beginDiagnosticSession() ?: return@launch
+                val client = StreamClient(host, port, applicationContext, diagnostics, attemptSession)
+                streamClient = client
+                setupStreamClientCallbacks(client, attemptSession)
+                client.connectWireless(token, deviceName)
                 // NOTE: onConnectSuccess is fired from the onConnectionStatus(true)
                 // listener (above) right after handshake OK — not here. This line
                 // would otherwise run AFTER the receive loop exits, i.e. AFTER
                 // disconnect, incorrectly transitioning back to CONNECTED.
             } catch (e: StreamClient.WirelessConnectError) {
+                diagnostics?.endSession(attemptSession)
                 runOnUiThread {
+                    if (!diagnosticCallbackIsCurrent(attemptSession)) return@runOnUiThread
                     wirelessController.onConnectError(e)
                 }
             } catch (e: Exception) {
+                diagnostics?.endSession(attemptSession)
                 log("Wireless connect failed: ${e.message}")
                 runOnUiThread {
+                    if (!diagnosticCallbackIsCurrent(attemptSession)) return@runOnUiThread
                     wirelessController.onConnectError(StreamClient.WirelessConnectError.NetworkUnreachable)
+                }
+            } finally {
+                if (diagnosticAttempts != null) {
+                    // Drain the already-posted UI callbacks before permitting a new diagnostic attempt.
+                    withContext(NonCancellable + Dispatchers.Main) { diagnosticAttempts.finish(attemptSession) }
                 }
             }
         }
@@ -976,37 +1054,48 @@ class MainActivity : AppCompatActivity() {
         port: Int,
     ) {
         lifecycleScope.launch(Dispatchers.IO) {
+            var attemptSession = 0L
             try {
                 log("Connecting to $host:$port...")
 
-                streamClient = StreamClient(host, port)
-                streamClient?.onFrameReceived = { frameData, frameSize, timestamp, isKeyframe ->
+                attemptSession = beginDiagnosticSession() ?: return@launch
+                val client = StreamClient(host, port, diagnostics = diagnostics, diagnosticSession = attemptSession)
+                streamClient = client
+                client.onFrameReceived = frame@ { frameData, frameSize, timestamp, isKeyframe ->
+                    if (!diagnosticCallbackIsCurrent(attemptSession)) {
+                        client.releaseBuffer(frameData)
+                        return@frame
+                    }
                     val dec = videoDecoder
                     if (dec != null) {
                         dec.decode(frameData, frameSize, timestamp, isKeyframe)
                     } else {
-                        streamClient?.releaseBuffer(frameData)
+                        client.releaseBuffer(frameData)
                     }
                 }
 
                 // Wire up buffer release callback for buffer pooling
                 // When decode completes, buffer is returned to StreamClient's pool
                 videoDecoder?.onFrameDecoded = { buffer ->
-                    streamClient?.releaseBuffer(buffer)
+                    client.releaseBuffer(buffer)
                 }
                 videoDecoder?.onKeyframeRequired = { force, reason ->
-                    streamClient?.requestKeyframe(force = force, reason = reason)
+                    client.requestKeyframe(force = force, reason = reason)
                 }
 
                 // Latency measurement via ping/pong
-                streamClient?.onLatencyMeasured = { rttMs ->
+                client.onLatencyMeasured = { rttMs ->
                     runOnUiThread {
+                        if (!diagnosticCallbackIsCurrent(attemptSession)) return@runOnUiThread
                         binding.latencyText.text = String.format("%.1f ms", rttMs)
                     }
                 }
 
-                streamClient?.onConnectionStatus = { connected ->
+                client.onConnectionStatus = status@ { connected ->
+                    if (!diagnosticCallbackIsCurrent(attemptSession)) return@status
+                    diagnosticAttempts?.connectionStatus(attemptSession, connected)
                     runOnUiThread {
+                        if (!diagnosticCallbackIsCurrent(attemptSession)) return@runOnUiThread
                         // Update connection state flag
                         isConnected = connected
 
@@ -1063,7 +1152,8 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
 
-                streamClient?.onDisplaySize = { width, height, rotation ->
+                client.onDisplaySize = display@ { width, height, rotation ->
+                    if (!diagnosticCallbackIsCurrent(attemptSession)) return@display
                     mainDiag("onDisplaySize: ${width}x$height @ $rotation°")
                     warnIfAvcOnlyWithoutNegotiation()
                     displayWidth = width
@@ -1079,6 +1169,7 @@ class MainActivity : AppCompatActivity() {
                         if (holder != null && holder.surface.isValid) {
                             mainDiag("Display config arrived, initializing decoder ${width}x$height")
                             runOnUiThread {
+                                if (!diagnosticCallbackIsCurrent(attemptSession)) return@runOnUiThread
                                 // Re-check under UI thread to prevent race with surfaceChanged
                                 if (videoDecoder == null) {
                                     initializeDecoder(holder)
@@ -1090,6 +1181,7 @@ class MainActivity : AppCompatActivity() {
                     }
 
                     runOnUiThread {
+                        if (!diagnosticCallbackIsCurrent(attemptSession)) return@runOnUiThread
                         binding.resolutionText.text = "${width}x$height"
                         // Apply rotation to SurfaceView
                         applyRotation(rotation)
@@ -1097,15 +1189,17 @@ class MainActivity : AppCompatActivity() {
                     log("Display: ${width}x$height @ $rotation°")
                 }
 
-                streamClient?.onStats = { fps, mbps ->
+                client.onStats = { fps, mbps ->
                     runOnUiThread {
+                        if (!diagnosticCallbackIsCurrent(attemptSession)) return@runOnUiThread
                         binding.fpsText.text = String.format("%.1f", fps)
                         binding.bitrateText.text = String.format("%.1f Mbps", mbps)
                     }
                 }
 
-                streamClient?.connect()
+                client.connect()
             } catch (e: Exception) {
+                diagnostics?.endSession(attemptSession)
                 val errorMessage =
                     when {
                         e.message?.contains("ECONNREFUSED") == true -> {
@@ -1127,13 +1221,22 @@ class MainActivity : AppCompatActivity() {
                                 "• Check USB connection\n• Run: adb reverse tcp:$port tcp:$port"
                         }
                     }
-                updateStatus("Connection failed")
-                showError(errorMessage)
+                runOnUiThread {
+                    if (!diagnosticCallbackIsCurrent(attemptSession)) return@runOnUiThread
+                    updateStatus("Connection failed")
+                    showError(errorMessage)
+                }
+            } finally {
+                if (diagnosticAttempts != null) {
+                    // Drain the already-posted UI callbacks before permitting a new diagnostic attempt.
+                    withContext(NonCancellable + Dispatchers.Main) { diagnosticAttempts.finish(attemptSession) }
+                }
             }
         }
     }
 
     private fun disconnect() {
+        diagnostics?.endSession(diagnosticSession)
         stopPingTimer()
         streamClient?.disconnect()
         // Reset display config so next connect defers decoder init until config arrives

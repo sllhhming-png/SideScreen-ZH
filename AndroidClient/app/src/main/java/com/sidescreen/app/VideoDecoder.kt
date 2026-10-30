@@ -3,6 +3,7 @@ package com.sidescreen.app
 import android.media.MediaCodec
 import android.media.MediaCodecList
 import android.media.MediaFormat
+import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Process
@@ -19,8 +20,11 @@ class VideoDecoder(
     initialWidth: Int = 1920,
     initialHeight: Int = 1200,
     private val mime: String = MediaFormat.MIMETYPE_VIDEO_HEVC,
+    private val diagnostics: DiagnosticStats? = null,
+    @Volatile private var diagnosticSession: Long = 0,
 ) {
     private var decoder: MediaCodec? = null
+    @Volatile private var diagnosticCodec: MediaCodec? = null
     private var decoderThread: HandlerThread? = null
     private var decoderHandler: Handler? = null
 
@@ -77,7 +81,55 @@ class VideoDecoder(
         }
     }
 
+    fun setDiagnosticSession(session: Long) {
+        diagnosticSession = session
+        // Existing decoder can survive a reconnect. Old listener closures keep their old session ID.
+        diagnosticCodec?.let { codec ->
+            recordDiagnosticCodec(codec)
+            installDiagnosticListener(codec)
+            try { recordDiagnosticOutputFormat(codec, codec.outputFormat) } catch (_: Exception) {}
+        }
+    }
+
+    private fun recordDiagnosticCodec(codec: MediaCodec) {
+        val stats = diagnostics ?: return
+        val session = diagnosticSession
+        try {
+            val info = codec.codecInfo
+            val hardware = if (Build.VERSION.SDK_INT >= 29) info.isHardwareAccelerated else null
+            val supported = try {
+                info.getCapabilitiesForType(mime).videoCapabilities?.areSizeAndRateSupported(2000, 1200, 60.0)
+            } catch (_: Exception) { null }
+            if (codec === diagnosticCodec && session == diagnosticSession) stats.codec(session, codec.name, hardware, supported)
+        } catch (_: Exception) {
+            // Diagnostic failures must not change decoder selection or playback.
+        }
+    }
+
+    private fun recordDiagnosticOutputFormat(codec: MediaCodec, format: MediaFormat) {
+        if (diagnostics == null || codec !== diagnosticCodec) return
+        try {
+            diagnostics.outputSize(diagnosticSession, format.getInteger(MediaFormat.KEY_WIDTH), format.getInteger(MediaFormat.KEY_HEIGHT))
+        } catch (_: Exception) {}
+    }
+
+    private fun installDiagnosticListener(codec: MediaCodec) {
+        val stats = diagnostics ?: return
+        val session = diagnosticSession
+        try {
+            codec.setOnFrameRenderedListener({ renderedCodec, presentationTimeUs, nanoTime ->
+                if (renderedCodec === diagnosticCodec && session == diagnosticSession) {
+                    // Use the event's actual timestamp, never callback arrival System.nanoTime().
+                    stats.presented(session, presentationTimeUs, nanoTime)
+                }
+            }, decoderHandler)
+        } catch (_: Exception) {
+            // Missing listener/callbacks remain unknown; never synthesize presentation events.
+        }
+    }
+
     private fun setupDecoder() {
+        diagnostics?.resetDecoder(diagnosticSession, System.nanoTime())
         decoderThread = HandlerThread("DecoderThread", Process.THREAD_PRIORITY_DISPLAY).also { it.start() }
         decoderHandler = Handler(decoderThread!!.looper)
 
@@ -124,6 +176,7 @@ class VideoDecoder(
                     format: MediaFormat,
                 ) {
                     diagLog("Output format changed: $format")
+                    recordDiagnosticOutputFormat(codec, format)
                 }
             }
         codec.setCallback(callback, decoderHandler)
@@ -196,6 +249,11 @@ class VideoDecoder(
         }
 
         codec.setVideoScalingMode(MediaCodec.VIDEO_SCALING_MODE_SCALE_TO_FIT)
+        if (diagnostics != null) {
+            diagnosticCodec = codec
+            recordDiagnosticCodec(codec)
+            installDiagnosticListener(codec)
+        }
         needsKeyframe = true
         isRunning = true
         codec.start()
@@ -368,6 +426,10 @@ class VideoDecoder(
             inputBuffer.clear()
             inputBuffer.put(frameData, 0, frameSize)
             codec.queueInputBuffer(index, 0, frameSize, frameTimestamp / 1000, 0)
+            diagnostics?.let { stats ->
+                val session = diagnosticSession
+                stats.input(session, frameTimestamp / 1000)
+            }
             if (isKeyframe) {
                 needsKeyframe = false
             }
@@ -422,6 +484,10 @@ class VideoDecoder(
     ) {
         try {
             outputFrameCount++
+            diagnostics?.let { stats ->
+                val session = diagnosticSession
+                if (codec === diagnosticCodec) stats.output(session, info.presentationTimeUs)
+            }
             if (outputFrameCount == 1L) {
                 diagLog("First output frame! size=${info.size}, flags=${info.flags}")
             }
@@ -471,7 +537,9 @@ class VideoDecoder(
                 return
             }
 
+            val handoffNs = if (diagnostics != null) System.nanoTime() else 0L
             codec.releaseOutputBuffer(index, true)
+            if (codec === diagnosticCodec) diagnostics?.handedToSurface(diagnosticSession, info.presentationTimeUs, handoffNs)
             trackFrameTiming(System.nanoTime())
             updateStats()
         } catch (e: Exception) {
@@ -512,6 +580,7 @@ class VideoDecoder(
     }
 
     fun release() {
+        diagnosticCodec = null
         isRunning = false
         try {
             availableInputBuffers.clear()

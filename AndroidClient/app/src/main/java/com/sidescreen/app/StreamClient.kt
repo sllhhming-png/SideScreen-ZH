@@ -22,6 +22,8 @@ class StreamClient(
     private val host: String,
     private val port: Int,
     private val context: Context? = null,
+    private val diagnostics: DiagnosticStats? = null,
+    private val diagnosticSession: Long = 0,
 ) {
     private var socket: Socket? = null
     private var inputStream: DataInputStream? = null
@@ -494,6 +496,7 @@ class StreamClient(
 
         // Capture timestamp after full frame received for accurate age tracking.
         val receiveTimestamp = System.nanoTime()
+        diagnostics?.received(diagnosticSession)
         checkKeyframeFreshness(receiveTimestamp, isKeyframe)
         diagFrameCount++
         if (diagFrameCount == 1L) {

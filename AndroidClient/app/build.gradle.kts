@@ -17,9 +17,21 @@ android {
         targetSdk = 34
         versionCode = computedVersionCode
         versionName = appVersion
+        buildConfigField("boolean", "DIAGNOSTICS", "false")
     }
 
     buildTypes {
+        create("diagnostic") {
+            initWith(getByName("debug"))
+            isDebuggable = false
+            applicationIdSuffix = ".cn.diag"
+            versionNameSuffix = "-cn-diag"
+            resValue("string", "app_name", "Side Screen 中文诊断")
+            buildConfigField("boolean", "DIAGNOSTICS", "true")
+            // Review/signing is owned by the controller; never use a private release key here.
+            signingConfig = null
+            matchingFallbacks += listOf("debug")
+        }
         release {
             applicationIdSuffix = ".cn"
             isMinifyEnabled = false
@@ -38,6 +50,7 @@ android {
 
     buildFeatures {
         viewBinding = true
+        buildConfig = true
     }
 }
 

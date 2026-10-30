@@ -204,6 +204,14 @@
                 android:gravity="center"
                 android:layout_marginBottom="20dp" />
 
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/diagnosticHomeButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="查看当前 / 上次诊断（无需重连）"
+                android:visibility="gone"
+                android:layout_marginBottom="12dp" />
+
             <!-- Mode toggle: USB / Wireless -->
             <com.google.android.material.button.MaterialButtonToggleGroup
                 android:id="@+id/modeToggleGroup"

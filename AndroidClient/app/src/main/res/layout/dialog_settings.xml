@@ -331,6 +331,14 @@
                 app:backgroundTint="#1AFFFFFF" />
         </LinearLayout>
 
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/diagnosticSettingsButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="查看 / 复制诊断数字"
+            android:visibility="gone"
+            android:layout_marginTop="8dp" />
+
         <!-- Disconnect Button -->
         <com.google.android.material.button.MaterialButton
             android:id="@+id/disconnectSettingsButton"
