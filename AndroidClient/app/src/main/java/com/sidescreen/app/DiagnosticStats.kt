@@ -18,13 +18,21 @@ data class DiagnosticSnapshot(
     val observations: StageObservationSnapshot? = null,
     val inputNotQueued: Map<InputNotQueuedReason, Long> = emptyMap(),
     val staleOutputDrops: Long = 0,
+    val recoveryPolicy: InputRecoveryPolicy? = null,
+    val recoveryCounts: List<Long> = emptyList(),
+    val recoveryWait: DelaySummary? = null,
 ) {
     /** Allowlist only: never append MediaFormat, exceptions, connection data or existing logs. */
     fun text(androidVersion: String, api: Int, appVersion: String = "unknown"): String = buildString {
-        appendLine("Side Screen 中文诊断（非延迟修复/验收）")
+        appendLine("Side Screen 中文诊断（输入恢复实验，待实机验收）")
         appendLine("应用版本: $appVersion")
         appendLine("Android $androidVersion / API $api")
         appendLine("会话: ${if (sessionId == 0L) "未开始（unknown）" else "#$sessionId " + if (ended) "已断开（保留最后汇总）" else "采集中（连接尝试 / 串流）"}")
+        appendLine("输入恢复实验: requested=${recoveryPolicy?.requested ?: false} / active=${recoveryPolicy?.active ?: false}；${recoveryPolicy?.reason ?: "unknown（尚无codec）"}")
+        appendLine("adaptive声明=${recoveryPolicy?.adaptive?.toString() ?: "unknown"}；短等预算=5ms（调度可能超时）")
+        appendLine("当前epoch输入恢复: 即时空槽=${recoveryCounts.getOrElse(0){0}} / 短等救回=${recoveryCounts.getOrElse(1){0}} / 活跃超时=${recoveryCounts.getOrElse(2){0}} / 取消=${recoveryCounts.getOrElse(3){0}} / 线程跳过等待=${recoveryCounts.getOrElse(4){0}} / 活跃等待中断=${recoveryCounts.getOrElse(5){0}}")
+        appendLine("空槽后实际等待: ${format(recoveryWait)}（最近最多240次；非5ms硬实时保证）")
+        appendLine("active路径NO_INPUT_BUFFER为短等后最终丢弃，WAITING_KEYFRAME含安全恢复跳过；活跃等待中断另列，不记为超时或queue异常；旧策略即时丢弃。计数下降不能单独证明改善，仍待实机验收。")
         appendLine("卡顿检查摘要：当前codec观察epoch=$observationEpoch，接收PTS窗口=${observations?.frames ?: 0}/240")
         appendLine("同一PTS窗口内且邻接链已覆盖的真实事件间隔")
         for (stage in listOf(ObservationStage.RECEIVE,ObservationStage.OUTPUT,ObservationStage.HANDOFF,ObservationStage.RENDER)) {
@@ -106,6 +114,23 @@ class DiagnosticStats(private val capacity: Int = 240) {
     private val stageObservations = StageObservations(capacity)
     private val inputReasons = LongArray(InputNotQueuedReason.values().size)
     private var staleOutputs = 0L
+    private var recoveryPolicy: InputRecoveryPolicy? = null
+    private val recoveryCounts = LongArray(6)
+    private val recoveryWaits = ArrayDeque<Long>()
+    private fun resetRecovery() { recoveryPolicy = null; recoveryCounts.fill(0); recoveryWaits.clear() }
+    @Synchronized fun recoveryPolicy(session: Long, policy: InputRecoveryPolicy) {
+        if (session == this.session && session > 0 && !ended) recoveryPolicy = policy
+    }
+    @Synchronized fun recoveryResult(session: Long, ptsUs: Long, epoch: Long, result: RecoveryResult) {
+        if (!accepts(session,ptsUs,epoch)) return
+        if(result.immediateEmpty) recoveryCounts[0]++
+        if(result.rescued) recoveryCounts[1]++
+        if(result.status == RecoveryStatus.TIMEOUT) recoveryCounts[2]++
+        if(result.status == RecoveryStatus.CANCELLED) recoveryCounts[3]++
+        if(result.threadSkipped) recoveryCounts[4]++
+        if(result.status == RecoveryStatus.INTERRUPTED) recoveryCounts[5]++
+        result.waitNs?.takeIf { it >= 0 }?.let { recoveryWaits.addLast(it); if(recoveryWaits.size > capacity) recoveryWaits.removeFirst() }
+    }
 
     @Synchronized fun beginSession(startNs: Long): Long {
         session++
@@ -115,6 +140,7 @@ class DiagnosticStats(private val capacity: Int = 240) {
         codecName = null; hardware = null; supportsTarget = null; width = null; height = null
         crop = null
         configuration.clear()
+        resetRecovery()
         outputTimes.clear()
         releaseDurations.clear()
         handoffTimes.clear()
@@ -131,6 +157,7 @@ class DiagnosticStats(private val capacity: Int = 240) {
         codecName = null; hardware = null; supportsTarget = null; width = null; height = null
         crop = null
         configuration.clear()
+        resetRecovery()
         outputTimes.clear()
         releaseDurations.clear()
         handoffTimes.clear()
@@ -232,6 +259,7 @@ class DiagnosticStats(private val capacity: Int = 240) {
             crop, configuration.toList(),
             stageObservations.epoch(), stageObservations.snapshot(),
             InputNotQueuedReason.values().associateWith { inputReasons[it.ordinal] }, staleOutputs,
+            recoveryPolicy,recoveryCounts.toList(),summarize(recoveryWaits.toList()),
         )
     }
 
