@@ -1,14 +1,12 @@
 package com.sidescreen.app
 
 import android.media.MediaCodec
-import android.media.MediaCodecInfo
 import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Process
-import android.os.Looper
 import android.util.Log
 import android.view.Display
 import android.view.Surface
@@ -26,8 +24,6 @@ class VideoDecoder(
     @Volatile private var diagnosticSession: Long = 0,
 ) {
     private var decoder: MediaCodec? = null
-    private val inputRecovery = if (BuildConfig.DIAGNOSTICS && BuildConfig.INPUT_RECOVERY_EXPERIMENT) InputRecoveryCoordinator<MediaCodec>() else null
-    private var recoveryPolicy: InputRecoveryPolicy? = null
     @Volatile private var diagnosticCodec: MediaCodec? = null
     @Volatile private var diagnosticObservationEpoch = 0L
     @Volatile private var callbackOwnerForRelease: VendorCallbackOwner? = null
@@ -88,13 +84,9 @@ class VideoDecoder(
         }
     }
 
-    fun cancelInputSession(session: Long) { inputRecovery?.cancel(session) }
-
     fun setDiagnosticSession(session: Long) {
-        inputRecovery?.reconnect(session)
         diagnosticSession = session
         diagnosticObservationEpoch = diagnostics?.observationEpoch(session) ?: 0L
-        recoveryPolicy?.let { diagnostics?.recoveryPolicy(session, it) }
         // Existing decoder can survive a reconnect. Old listener closures keep their old session ID.
         diagnosticCodec?.let { codec ->
             diagnostics?.let { configurationHistory?.replayInto(it, session) }
@@ -176,23 +168,14 @@ class VideoDecoder(
         callbackOwner.bind(codec)
         callbackOwnerForRelease = callbackOwner
 
-        fun newCallback(nativeCodec: MediaCodec): MediaCodec.Callback {
-            val policy = if (inputRecovery != null) {
-                val adaptive = try { nativeCodec.codecInfo.getCapabilitiesForType(mime).isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_AdaptivePlayback) } catch (_: Exception) { null }
-                InputRecoveryPolicy.select(true,Build.VERSION.SDK_INT,nativeCodec.name,mime,adaptive)
-            } else null
-            recoveryPolicy = policy
-            policy?.let { diagnostics?.recoveryPolicy(diagnosticSession,it) }
-            val inputOwner = policy?.let { inputRecovery!!.attach(nativeCodec,it,diagnosticSession) }
-            return object : MediaCodec.Callback() {
+        val callback =
+            object : MediaCodec.Callback() {
                 override fun onInputBufferAvailable(
                     codec: MediaCodec,
                     index: Int,
                 ) {
                     if (!callbackOwner.accepts(codec)) return
-                    if (inputOwner != null && !inputRecovery!!.isNativeCurrent(inputOwner)) return
-                    if (inputOwner != null) inputRecovery!!.offer(inputOwner,codec,index)
-                    else availableInputBuffers.offer(index)
+                    availableInputBuffers.offer(index)
                 }
 
                 override fun onOutputBufferAvailable(
@@ -201,7 +184,6 @@ class VideoDecoder(
                     info: MediaCodec.BufferInfo,
                 ) {
                     if (!callbackOwner.accepts(codec)) return
-                    if (inputOwner != null && !inputRecovery!!.isNativeCurrent(inputOwner)) return
                     handleOutputBuffer(codec, index, info)
                 }
 
@@ -210,18 +192,10 @@ class VideoDecoder(
                     e: MediaCodec.CodecException,
                 ) {
                     if (!callbackOwner.accepts(codec)) return
-                    if (inputOwner != null && !inputRecovery!!.isNativeCurrent(inputOwner)) return
                     diagLog("Codec error: ${e.diagnosticInfo}")
                     Log.e(TAG, "Codec error: ${e.diagnosticInfo}", e)
-                    if (inputOwner != null) {
-                        val session = diagnosticSession
-                        val request = onKeyframeRequired
-                        inputRecovery!!.requireSync(inputOwner)
-                        if (inputRecovery.shouldRequest(inputOwner,session,true,System.nanoTime())) request?.invoke(true,"codec error")
-                    } else {
-                        needsKeyframe = true
-                        requestKeyframe("codec error", force = true)
-                    }
+                    needsKeyframe = true
+                    requestKeyframe("codec error", force = true)
                 }
 
                 override fun onOutputFormatChanged(
@@ -229,13 +203,10 @@ class VideoDecoder(
                     format: MediaFormat,
                 ) {
                     if (!callbackOwner.accepts(codec)) return
-                    if (inputOwner != null && !inputRecovery!!.isNativeCurrent(inputOwner)) return
                     diagLog("Output format changed: $format")
                     recordDiagnosticOutputFormat(codec, format)
                 }
             }
-        }
-        var callback = newCallback(codec)
         codec.setCallback(callback, decoderHandler)
 
         val format =
@@ -261,7 +232,6 @@ class VideoDecoder(
                     },
                     start = { candidate -> startConfiguredCodec(candidate) },
                     release = { rejected ->
-                        inputRecovery?.detach()
                         isRunning = false
                         decoder = null
                         diagnosticCodec = null
@@ -273,7 +243,6 @@ class VideoDecoder(
                         val fresh = MediaCodec.createByCodecName(actualName)
                         try {
                             callbackOwner.bind(fresh)
-                            callback = newCallback(fresh)
                             fresh.setCallback(callback, decoderHandler)
                         } catch (error: Exception) {
                             callbackOwner.clear()
@@ -295,7 +264,6 @@ class VideoDecoder(
                 recordConfigurationStep(configurationEpoch, DecoderConfigStep.VENDOR_RECOVERY_FAILED)
                 configurationHistory?.release()
                 callbackOwner.clear()
-                inputRecovery?.detach()
                 try { codec.release() } catch (_: Exception) {}
                 availableInputBuffers.clear()
                 decoderThread?.quitSafely()
@@ -319,9 +287,7 @@ class VideoDecoder(
         } catch (e: Exception) {
             diagLog("Full low-latency config failed: ${e.message}")
             recordConfigurationStep(configurationEpoch, DecoderConfigStep.FULL_REJECTED)
-            inputRecovery?.detach()
             codec.reset()
-            if (inputRecovery != null) callback = newCallback(codec)
             codec.setCallback(callback, decoderHandler)
         }
 
@@ -343,9 +309,7 @@ class VideoDecoder(
             } catch (e: Exception) {
                 diagLog("Basic config failed: ${e.message}")
                 recordConfigurationStep(configurationEpoch, DecoderConfigStep.BASIC_REJECTED)
-                inputRecovery?.detach()
                 codec.reset()
-                if (inputRecovery != null) callback = newCallback(codec)
                 codec.setCallback(callback, decoderHandler)
             }
         }
@@ -367,7 +331,6 @@ class VideoDecoder(
                 recordConfigurationStep(configurationEpoch, DecoderConfigStep.MINIMAL_REJECTED)
                 configurationHistory?.release()
                 Log.e(TAG, "All configure attempts failed", e)
-                inputRecovery?.detach()
                 codec.release()
                 decoderThread?.quitSafely()
                 decoderThread = null
@@ -480,14 +443,7 @@ class VideoDecoder(
         frameSize: Int = frameData.size,
         frameTimestamp: Long = System.nanoTime(),
         isKeyframe: Boolean = false,
-        connectionSession: Long = diagnosticSession,
-        releaseFrame: ((ByteArray) -> Unit)? = onFrameDecoded,
-        requestSync: ((Boolean, String) -> Unit)? = onKeyframeRequired,
     ) {
-        if (inputRecovery != null) {
-            decodeWithRecovery(frameData,frameSize,frameTimestamp,isKeyframe,connectionSession,releaseFrame,requestSync)
-            return
-        }
         val inputSession = diagnosticSession
         val inputEpoch = diagnosticObservationEpoch
         if (!isRunning) {
@@ -555,45 +511,6 @@ class VideoDecoder(
         }
 
         queueFrame(codec, index, frameData, frameSize, frameTimestamp, isKeyframe, inputSession, inputEpoch)
-    }
-
-    private fun decodeWithRecovery(data: ByteArray, size: Int, timestamp: Long, key: Boolean, session: Long,
-        returnFrame: ((ByteArray)->Unit)?, requestSync: ((Boolean,String)->Unit)?) {
-        val recovery = inputRecovery ?: return
-        val epoch = diagnosticObservationEpoch
-        val owner = recovery.owner()
-        if (!isRunning || owner == null) {
-            diagnostics?.notQueued(session,timestamp/1000,if (!isRunning) InputNotQueuedReason.NOT_RUNNING else InputNotQueuedReason.CODEC_MISSING,epoch)
-            returnFrame?.invoke(data)
-            return
-        }
-        val looper = Looper.myLooper()
-        val allowWait = looper != Looper.getMainLooper() && looper != decoderHandler?.looper
-        val result = recovery.process(owner,session,key,allowWait,{ returnFrame?.invoke(data) }) { codec,index ->
-            val input = codec.getInputBuffer(index) ?: throw IllegalStateException("missing input buffer")
-            input.clear(); input.put(data,0,size)
-            codec.queueInputBuffer(index,0,size,timestamp/1000,0)
-        }
-        diagnostics?.recoveryResult(session,timestamp/1000,epoch,result)
-        val reason = when(result.status) {
-            RecoveryStatus.QUEUED -> { diagnostics?.input(session,timestamp/1000,epoch); null }
-            RecoveryStatus.WAIT_SYNC -> InputNotQueuedReason.WAITING_KEYFRAME
-            RecoveryStatus.EMPTY, RecoveryStatus.TIMEOUT -> InputNotQueuedReason.NO_INPUT_BUFFER
-            RecoveryStatus.QUEUE_EXCEPTION -> InputNotQueuedReason.QUEUE_EXCEPTION
-            RecoveryStatus.CANCELLED, RecoveryStatus.INTERRUPTED -> null
-        }
-        reason?.let { diagnostics?.notQueued(session,timestamp/1000,it,epoch) }
-        // No network callback while either coordinator lock is held. The frame carries its original client callback.
-        val request = when(result.status) {
-            RecoveryStatus.EMPTY, RecoveryStatus.TIMEOUT -> true to "no input buffer"
-            RecoveryStatus.INTERRUPTED -> true to "active input wait interrupted"
-            RecoveryStatus.WAIT_SYNC -> false to "waiting for keyframe"
-            RecoveryStatus.QUEUE_EXCEPTION -> false to "queue input failed"
-            else -> null
-        }
-        if (request != null && recovery.shouldRequest(owner,session,request.first,System.nanoTime())) {
-            requestSync?.invoke(request.first,request.second)
-        }
     }
 
     private fun queueFrame(
@@ -774,8 +691,6 @@ class VideoDecoder(
     }
 
     fun release() {
-        inputRecovery?.detach() // waiters cancel before native stop/release; never hold lifecycle during stop.
-        recoveryPolicy = null
         callbackOwnerForRelease?.clear()
         callbackOwnerForRelease = null
         configurationHistory?.release()

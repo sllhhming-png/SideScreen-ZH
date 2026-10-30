@@ -19,7 +19,6 @@ android {
         versionName = appVersion
         buildConfigField("boolean", "DIAGNOSTICS", "false")
         buildConfigField("boolean", "HISI_LOW_LATENCY_EXPERIMENT", "false")
-        buildConfigField("boolean", "INPUT_RECOVERY_EXPERIMENT", "false")
     }
 
     buildTypes {
@@ -27,11 +26,10 @@ android {
             initWith(getByName("debug"))
             isDebuggable = false
             applicationIdSuffix = ".cn.diag"
-            versionNameSuffix = "-cn-diag4"
+            versionNameSuffix = "-cn-diag5-rollback"
             resValue("string", "app_name", "Side Screen 中文诊断")
             buildConfigField("boolean", "DIAGNOSTICS", "true")
             buildConfigField("boolean", "HISI_LOW_LATENCY_EXPERIMENT", "true")
-            buildConfigField("boolean", "INPUT_RECOVERY_EXPERIMENT", "true")
             // Review/signing is owned by the controller; never use a private release key here.
             signingConfig = null
             matchingFallbacks += listOf("debug")
@@ -77,6 +75,6 @@ dependencies {
 
 androidComponents {
     onVariants(selector().withBuildType("diagnostic")) { variant ->
-        variant.outputs.forEach { it.versionCode.set(1004) }
+        variant.outputs.forEach { it.versionCode.set(1005) }
     }
 }

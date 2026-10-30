@@ -864,13 +864,12 @@ class MainActivity : AppCompatActivity() {
                     MediaFormat.MIMETYPE_VIDEO_HEVC
                 }
             videoDecoder = VideoDecoder(holder.surface, displayObj, displayWidth, displayHeight, mime, diagnostics, diagnosticSession)
-            val decoderClient = if (BuildConfig.DIAGNOSTICS && BuildConfig.INPUT_RECOVERY_EXPERIMENT) streamClient else null
             // Wire up buffer release callback
             videoDecoder?.onFrameDecoded = { buffer ->
-                if (BuildConfig.DIAGNOSTICS && BuildConfig.INPUT_RECOVERY_EXPERIMENT) decoderClient?.releaseBuffer(buffer) else streamClient?.releaseBuffer(buffer)
+                streamClient?.releaseBuffer(buffer)
             }
             videoDecoder?.onKeyframeRequired = { force, reason ->
-                if (BuildConfig.DIAGNOSTICS && BuildConfig.INPUT_RECOVERY_EXPERIMENT) decoderClient?.requestKeyframe(force = force, reason = reason) else streamClient?.requestKeyframe(force = force, reason = reason)
+                streamClient?.requestKeyframe(force = force, reason = reason)
             }
             streamClient?.requestKeyframe(force = true, reason = "decoder initialized")
             mainDiag("Decoder initialized OK ${displayWidth}x$displayHeight mime=$mime, videoDecoder=$videoDecoder")
@@ -895,13 +894,8 @@ class MainActivity : AppCompatActivity() {
             }
             val dec = videoDecoder
             if (dec != null) {
-                if (BuildConfig.DIAGNOSTICS && BuildConfig.INPUT_RECOVERY_EXPERIMENT) {
-                    dec.decode(frameData, frameSize, timestamp, isKeyframe, callbackSession,
-                        { buffer -> client.releaseBuffer(buffer) },
-                        { force, reason -> client.requestKeyframe(force = force, reason = reason) })
-                } else dec.decode(frameData, frameSize, timestamp, isKeyframe)
+                dec.decode(frameData, frameSize, timestamp, isKeyframe)
             } else {
-                if (BuildConfig.DIAGNOSTICS && BuildConfig.INPUT_RECOVERY_EXPERIMENT) client.releaseBuffer(frameData)
                 mainDiag("FRAME DROPPED: videoDecoder is null!")
             }
         }
@@ -909,8 +903,6 @@ class MainActivity : AppCompatActivity() {
         videoDecoder?.onFrameDecoded = { buffer ->
             client.releaseBuffer(buffer)
         }
-
-        if (BuildConfig.DIAGNOSTICS && BuildConfig.INPUT_RECOVERY_EXPERIMENT) videoDecoder?.onKeyframeRequired = { force, reason -> client.requestKeyframe(force = force, reason = reason) }
 
         client.onLatencyMeasured = { rttMs ->
             runOnUiThread {
@@ -921,7 +913,6 @@ class MainActivity : AppCompatActivity() {
 
         client.onConnectionStatus = status@ { connected ->
             if (!diagnosticCallbackIsCurrent(callbackSession)) return@status
-            if (!connected) videoDecoder?.cancelInputSession(callbackSession)
             diagnosticAttempts?.connectionStatus(callbackSession, connected)
             runOnUiThread {
                 if (!diagnosticCallbackIsCurrent(callbackSession)) return@runOnUiThread
@@ -1041,14 +1032,12 @@ class MainActivity : AppCompatActivity() {
                 // would otherwise run AFTER the receive loop exits, i.e. AFTER
                 // disconnect, incorrectly transitioning back to CONNECTED.
             } catch (e: StreamClient.WirelessConnectError) {
-                videoDecoder?.cancelInputSession(attemptSession)
                 diagnostics?.endSession(attemptSession)
                 runOnUiThread {
                     if (!diagnosticCallbackIsCurrent(attemptSession)) return@runOnUiThread
                     wirelessController.onConnectError(e)
                 }
             } catch (e: Exception) {
-                videoDecoder?.cancelInputSession(attemptSession)
                 diagnostics?.endSession(attemptSession)
                 log("Wireless connect failed: ${e.message}")
                 runOnUiThread {
@@ -1083,11 +1072,7 @@ class MainActivity : AppCompatActivity() {
                     }
                     val dec = videoDecoder
                     if (dec != null) {
-                        if (BuildConfig.DIAGNOSTICS && BuildConfig.INPUT_RECOVERY_EXPERIMENT) {
-                            dec.decode(frameData, frameSize, timestamp, isKeyframe, attemptSession,
-                                { buffer -> client.releaseBuffer(buffer) },
-                                { force, reason -> client.requestKeyframe(force = force, reason = reason) })
-                        } else dec.decode(frameData, frameSize, timestamp, isKeyframe)
+                        dec.decode(frameData, frameSize, timestamp, isKeyframe)
                     } else {
                         client.releaseBuffer(frameData)
                     }
@@ -1112,7 +1097,6 @@ class MainActivity : AppCompatActivity() {
 
                 client.onConnectionStatus = status@ { connected ->
                     if (!diagnosticCallbackIsCurrent(attemptSession)) return@status
-                    if (!connected) videoDecoder?.cancelInputSession(attemptSession)
                     diagnosticAttempts?.connectionStatus(attemptSession, connected)
                     runOnUiThread {
                         if (!diagnosticCallbackIsCurrent(attemptSession)) return@runOnUiThread
@@ -1219,7 +1203,6 @@ class MainActivity : AppCompatActivity() {
 
                 client.connect()
             } catch (e: Exception) {
-                videoDecoder?.cancelInputSession(attemptSession)
                 diagnostics?.endSession(attemptSession)
                 val errorMessage =
                     when {
@@ -1257,7 +1240,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun disconnect() {
-        videoDecoder?.cancelInputSession(diagnosticSession)
         diagnostics?.endSession(diagnosticSession)
         stopPingTimer()
         streamClient?.disconnect()
